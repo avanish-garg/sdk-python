@@ -272,6 +272,18 @@ class SandboxMatcher:
     These override anything that may have been matched elsewhere.
     """
 
+    allow_call: Callable[..., bool] | None = None
+    """
+    If set, called with the arguments of each call to the restricted callable
+    and the call is allowed when it returns ``True``. This is only applicable to
+    leafs, so this must only be set when ``match_self`` is ``True`` and this
+    matcher is the ``__call__`` child of a callable's matcher.
+
+    Callables restricted this way are called without proxying their result so
+    that, for example, a ``time.struct_time`` can still be passed to C
+    functions that require a real tuple.
+    """
+
     all: ClassVar[SandboxMatcher]
     """Shortcut for an always-matched matcher."""
 
@@ -293,6 +305,8 @@ class SandboxMatcher:
             raise ValueError("Cannot set leaf_message without match_self")
         if self.leaf_warning and not self.match_self:
             raise ValueError("Cannot set leaf_warning without match_self")
+        if self.allow_call and not self.match_self:
+            raise ValueError("Cannot set allow_call without match_self")
 
     def access_matcher(
         self, context: RestrictionContext, *child_path: str, include_use: bool = False
@@ -552,6 +566,41 @@ def _public_callables(parent: Any, *, exclude: set[str] = set()) -> set[str]:
     return ret
 
 
+def _has_arg(index: int, name: str | None = None) -> Callable[..., bool]:
+    """Create a call filter that passes if the argument is given and not ``None``."""
+
+    def has_arg(*args: Any, **kwargs: Any) -> bool:
+        if len(args) > index:
+            return args[index] is not None
+        return name is not None and kwargs.get(name) is not None
+
+    return has_arg
+
+
+def _runtime_call_matcher(
+    message: str,
+    *,
+    allow_call: Callable[..., bool] | None = None,
+    use_all: bool = False,
+) -> SandboxMatcher:
+    """Create a matcher that restricts calling at runtime, except for calls that
+    ``allow_call`` accepts. If ``use_all``, anything on a result of the call is
+    restricted too.
+    """
+    return SandboxMatcher(
+        children={
+            "__call__": SandboxMatcher(
+                match_self=True,
+                only_runtime=True,
+                leaf_message=message,
+                allow_call=allow_call,
+            )
+        },
+        use={"*"} if use_all else frozenset(),  # type: ignore
+        only_runtime=True,
+    )
+
+
 SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
     children={
         "__builtins__": SandboxMatcher(
@@ -706,9 +755,23 @@ SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
         ),
         "platform": SandboxMatcher.all_uses_runtime,
         "poplib": SandboxMatcher.all_uses,
-        # Everything but instantiating Random and SecureRandom
+        # Module-level functions share one global Random and are all restricted.
+        # Classes are not in the public callables, so instantiating Random with
+        # a seed is fine but unseeded Random and all of SystemRandom are not.
         "random": SandboxMatcher(
-            use=_public_callables(random, exclude={"Random", "SecureRandom"}),
+            use=_public_callables(random),
+            children={
+                "Random": _runtime_call_matcher(
+                    "random.Random() without a seed is non-deterministic. Pass a "
+                    "seed or use workflow.random() instead.",
+                    allow_call=_has_arg(0, "x"),
+                ),
+                "SystemRandom": _runtime_call_matcher(
+                    "random.SystemRandom uses OS entropy and is "
+                    "non-deterministic. Use workflow.random() instead.",
+                    use_all=True,
+                ),
+            },
         ),
         "readline": SandboxMatcher.all_uses,
         "sched": SandboxMatcher.all_uses,
@@ -737,9 +800,11 @@ SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
         # type(sys) being used as types.ModuleType among other things
         # "sys": SandboxMatcher(access={"argv"}, only_runtime=True),
         "time": SandboxMatcher(
-            # TODO(cretz): Some functions in this package are only
-            # non-deterministic when they lack a param (e.g. ctime)
+            # Functions that are only non-deterministic when they lack a time
+            # param are in children
             use={
+                "clock_gettime",
+                "clock_gettime_ns",
                 "pthread_getcpuclockid",
                 "get_clock_info",
                 "localtime",
@@ -755,6 +820,31 @@ SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
                 "thread_time",
                 "thread_time_ns",
                 "tzset",
+            },
+            children={
+                "asctime": _runtime_call_matcher(
+                    "time.asctime() without a time tuple uses the current time "
+                    "which is non-deterministic. Pass a time tuple instead.",
+                    allow_call=_has_arg(0),
+                ),
+                "ctime": _runtime_call_matcher(
+                    "time.ctime() without seconds uses the current time which is "
+                    "non-deterministic. Pass seconds, e.g. from workflow.now(), "
+                    "instead.",
+                    allow_call=_has_arg(0),
+                ),
+                "gmtime": _runtime_call_matcher(
+                    "time.gmtime() without seconds uses the current time which is "
+                    "non-deterministic. Pass seconds, e.g. from workflow.now(), "
+                    "instead.",
+                    allow_call=_has_arg(0),
+                ),
+                "strftime": _runtime_call_matcher(
+                    "time.strftime() without a time tuple uses the current time "
+                    "which is non-deterministic. Pass a time tuple, e.g. from "
+                    "workflow.now().timetuple(), instead.",
+                    allow_call=_has_arg(1),
+                ),
             },
             # We allow time calls at import time
             only_runtime=True,
@@ -839,11 +929,18 @@ class _RestrictionState:
     context: RestrictionContext
     matcher: SandboxMatcher
 
-    def assert_child_not_restricted(self, name: str) -> None:
+    def assert_child_not_restricted(
+        self,
+        name: str,
+        args: Sequence[Any] = (),
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
         if temporalio.workflow.unsafe.is_sandbox_unrestricted():
             return
         matcher = self.matcher.access_matcher(self.context, name)
         if not matcher:
+            return
+        if matcher.allow_call and matcher.allow_call(*args, **(kwargs or {})):
             return
 
         logger.warning("%s on %s restricted", name, self.name)
@@ -1047,8 +1144,13 @@ class _RestrictedProxy:
     def __call__(self, *args: Any, **kwargs: Any) -> _RestrictedProxy:
         state = _RestrictionState.from_proxy(self)
         _trace("__call__ on %s", state.name)
-        state.assert_child_not_restricted("__call__")
+        state.assert_child_not_restricted("__call__", args, kwargs)
         ret = state.obj(*args, **kwargs)  # type: ignore
+        call_matcher = state.matcher.children.get("__call__")
+        if call_matcher and call_matcher.allow_call:
+            # Proxying would break C callers expecting the real value, e.g.
+            # strftime with a struct_time
+            return ret
         # Always wrap the result of a call to self with the same restrictions
         # (this is often instantiating a class)
         if _is_restrictable(ret):

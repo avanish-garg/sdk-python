@@ -1,0 +1,1 @@
+The workflow sandbox now rejects `time.gmtime()`, `time.ctime()`, `time.asctime()` and `time.strftime(fmt)` called without a time, `time.clock_gettime`, `random.SystemRandom` and unseeded `random.Random()`, which previously returned different values on replay.

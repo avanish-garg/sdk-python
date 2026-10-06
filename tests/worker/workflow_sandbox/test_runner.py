@@ -5,6 +5,7 @@ import dataclasses
 import functools
 import inspect
 import os
+import random
 import sys
 import time
 import uuid
@@ -42,6 +43,13 @@ global_state = ["global orig"]
 # We just access os.name in here to show we _can_. It's access-restricted at
 # runtime only
 _ = os.name
+# Call forms that are only restricted at runtime can be used at import time
+_import_time_calls = (
+    random.Random(),
+    random.SystemRandom(),
+    time.gmtime(),
+    time.strftime("%Y"),
+)
 
 # This used to fail because our __init__ couldn't handle metaclass init
 import zipfile  # noqa: E402
@@ -190,7 +198,24 @@ async def test_workflow_sandbox_restrictions(client: Client):
             "import urllib.request\nurllib.request.urlopen('example.com')",
             "import http.client\nhttp.client.HTTPConnection('example.com')",
             "import uuid\nuuid.uuid4()",
+            # Calls that are only non-deterministic without a time or seed
+            "import time\ntime.gmtime()",
+            "import time\ntime.ctime()",
+            "import time\ntime.asctime()",
+            "import time\ntime.strftime('%Y')",
+            "import random\nrandom.Random()",
+            "import random\nrandom.Random(None)",
+            "from random import Random\nRandom()",
+            "import random\nrandom.SystemRandom().random()",
         ]
+
+        if hasattr(time, "clock_gettime"):
+            invalid_code_to_check.append(
+                "import time\ntime.clock_gettime(time.CLOCK_REALTIME)"
+            )
+            invalid_code_to_check.append(
+                "import time\ntime.clock_gettime_ns(time.CLOCK_REALTIME)"
+            )
 
         # We can only validate this restriction prior to 3.14 because we had to exempt it due to
         # https://github.com/python/cpython/issues/140228
@@ -234,6 +259,16 @@ async def test_workflow_sandbox_restrictions(client: Client):
             "import uuid\nuuid.uuid5(uuid.NAMESPACE_DNS, 'example.com')",
             # Other imports we want to allow
             "from concurrent.futures import ThreadPoolExecutor",
+            # Time calls given a time are deterministic
+            "import time\ntime.strftime('%Y', time.gmtime(0))",
+            "import time\ntime.asctime(time.gmtime(0))",
+            "import time\ntime.ctime(0)",
+            "import time\nfrom temporalio import workflow\n"
+            "time.strftime('%Y', workflow.now().timetuple())",
+            # Seeded randoms are deterministic
+            "import random\nrandom.Random(5).random()",
+            "import random\nrandom.Random(x=5).random()",
+            "from random import Random\nRandom('seed').random()",
         ]
         for code in valid_code_to_check:
             await client.execute_workflow(
@@ -274,6 +309,47 @@ async def test_workflow_sandbox_restrictions(client: Client):
             )
         assert isinstance(err.value.cause, ApplicationError)
         assert err.value.cause.type == "RestrictedWorkflowAccessError"
+
+
+@workflow.defn
+class DeterministicCallFormsWorkflow:
+    def __init__(self) -> None:
+        self.values = [
+            str(random.Random(5).random()),
+            time.strftime("%Y-%m-%d %H:%M:%S", workflow.now().timetuple()),
+            time.ctime(0),
+            time.asctime(time.gmtime(0)),
+        ]
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: False)
+
+    @workflow.query
+    def values_query(self) -> list[str]:
+        return self.values
+
+
+async def test_workflow_sandbox_deterministic_call_forms(client: Client):
+    # Without caching every query replays the workflow, so non-deterministic
+    # values would differ between queries
+    async with Worker(
+        client,
+        task_queue=str(uuid.uuid4()),
+        workflows=[DeterministicCallFormsWorkflow],
+        max_cached_workflows=0,
+    ) as worker:
+        handle = await client.start_workflow(
+            DeterministicCallFormsWorkflow.run,
+            id=f"workflow-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        first = await handle.query(DeterministicCallFormsWorkflow.values_query)
+        await asyncio.sleep(1.1)
+        second = await handle.query(DeterministicCallFormsWorkflow.values_query)
+        assert first == second
+        assert first[0] == str(random.Random(5).random())
+        await handle.terminate()
 
 
 @workflow.defn
