@@ -629,7 +629,8 @@ class _Definition:
             if dynamic and (
                 not arg_types
                 or len(arg_types) != 1
-                or arg_types[0] != Sequence[temporalio.common.RawValue]
+                or temporalio.common._strip_annotated(arg_types[0])
+                != Sequence[temporalio.common.RawValue]
             ):
                 raise TypeError(
                     "Dynamic activity must accept a single Sequence[temporalio.common.RawValue]"

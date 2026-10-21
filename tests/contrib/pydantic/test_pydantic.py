@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import datetime
 import os
@@ -5,18 +6,25 @@ import pathlib
 import pickle
 import typing
 import uuid
+from collections.abc import AsyncIterator
 
 import pydantic
 import pytest
 from pydantic import BaseModel
 
 import temporalio.contrib.pydantic
-from temporalio.client import Client
+from temporalio.client import (
+    Client,
+    WorkflowFailureError,
+    WorkflowQueryFailedError,
+    WorkflowUpdateFailedError,
+)
 from temporalio.contrib.pydantic import (
     PydanticJSONPlainPayloadConverter,
     PydanticPayloadConverter,
     pydantic_data_converter,
 )
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox._restrictions import (
     RestrictionContext,
@@ -24,6 +32,7 @@ from temporalio.worker.workflow_sandbox._restrictions import (
     _RestrictedProxy,
 )
 from tests.contrib.pydantic.activities import (
+    annotated_params_activity,
     misc_objects_activity,
     pydantic_objects_activity,
 )
@@ -34,6 +43,9 @@ from tests.contrib.pydantic.models import (
     make_list_of_pydantic_objects,
 )
 from tests.contrib.pydantic.workflows import (
+    AnnotatedActivityParamsWorkflow,
+    AnnotatedBadReturnWorkflow,
+    AnnotatedParamsWorkflow,
     CloneObjectsWorkflow,
     ComplexCustomTypeWorkflow,
     ComplexCustomUnionTypeWorkflow,
@@ -47,6 +59,7 @@ from tests.contrib.pydantic.workflows import (
     _test_pydantic_model_with_strict_field,
     clone_objects,
 )
+from tests.helpers import assert_task_fail_eventually
 
 _MANY_TYPE_HINTS = tuple(
     typing.cast(type, typing.cast(object, typing.Annotated[list[int], index]))
@@ -529,6 +542,134 @@ async def test_validation_error(client: Client):
                 id=str(uuid.uuid4()),
                 task_queue=task_queue_name,
                 result_type=tuple[int],
+            )
+
+
+@contextlib.asynccontextmanager
+async def _annotated_params_worker(
+    client: Client,
+) -> AsyncIterator[tuple[Client, str]]:
+    new_config = client.config()
+    new_config["data_converter"] = pydantic_data_converter
+    client = Client(**new_config)
+    task_queue = str(uuid.uuid4())
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[
+            AnnotatedParamsWorkflow,
+            AnnotatedActivityParamsWorkflow,
+            AnnotatedBadReturnWorkflow,
+        ],
+        activities=[annotated_params_activity],
+    ):
+        yield client, task_queue
+
+
+async def test_annotated_workflow_params(client: Client):
+    async with _annotated_params_worker(client) as (client, task_queue):
+        # Raw values are sent, so these are only normalized if the annotations
+        # on the run parameters are applied when decoding the arguments
+        handle = await client.start_workflow(
+            AnnotatedParamsWorkflow.run,
+            args=[3, "  abc-1 "],
+            id=str(uuid.uuid4()),
+            task_queue=task_queue,
+        )
+        await handle.signal(AnnotatedParamsWorkflow.finish)
+        assert await handle.result() == "3:ABC-1:0:[]"
+
+        # Invalid arguments fail the workflow task, like invalid model fields
+        invalid = await client.start_workflow(
+            AnnotatedParamsWorkflow.run,
+            args=[-5, "abc"],
+            id=str(uuid.uuid4()),
+            task_queue=task_queue,
+        )
+        await assert_task_fail_eventually(
+            invalid, message_contains="Failed decoding arguments"
+        )
+        await invalid.terminate()
+
+
+async def test_annotated_activity_params(client: Client):
+    async with _annotated_params_worker(client) as (client, task_queue):
+        assert (
+            await client.execute_workflow(
+                AnnotatedActivityParamsWorkflow.run,
+                args=[3, "  abc-1 "],
+                id=str(uuid.uuid4()),
+                task_queue=task_queue,
+            )
+            == "3:ABC-1"
+        )
+
+        with pytest.raises(WorkflowFailureError) as err:
+            await client.execute_workflow(
+                AnnotatedActivityParamsWorkflow.run,
+                args=[-5, "abc"],
+                id=str(uuid.uuid4()),
+                task_queue=task_queue,
+            )
+        assert isinstance(err.value.cause, ActivityError)
+        assert isinstance(err.value.cause.cause, ApplicationError)
+        assert "Failed decoding arguments" in str(err.value.cause.cause)
+
+
+async def test_annotated_handler_params(client: Client):
+    async with _annotated_params_worker(client) as (client, task_queue):
+        handle = await client.start_workflow(
+            AnnotatedParamsWorkflow.run,
+            args=[1, "abc"],
+            id=str(uuid.uuid4()),
+            task_queue=task_queue,
+        )
+        await handle.signal(AnnotatedParamsWorkflow.add, 2)
+        await handle.execute_update(AnnotatedParamsWorkflow.bump, args=[4, "  xyz "])
+        assert await handle.query(AnnotatedParamsWorkflow.total_times, 10) == 60
+        assert await handle.query(AnnotatedParamsWorkflow.describe, " q ") == "[Q]"
+        await handle.signal(AnnotatedParamsWorkflow.finish)
+        assert await handle.result() == "1:ABC:6:['XYZ']"
+
+        # Invalid arguments are rejected without affecting the workflow
+        handle = await client.start_workflow(
+            AnnotatedParamsWorkflow.run,
+            args=[1, "abc"],
+            id=str(uuid.uuid4()),
+            task_queue=task_queue,
+        )
+        with pytest.raises(WorkflowQueryFailedError):
+            await handle.query(AnnotatedParamsWorkflow.total_times, -1)
+        with pytest.raises(WorkflowUpdateFailedError):
+            await handle.execute_update(AnnotatedParamsWorkflow.bump, args=[-1, "abc"])
+        assert await handle.query(AnnotatedParamsWorkflow.total_times, 1) == 0
+        await handle.terminate()
+
+
+async def test_annotated_return_types(client: Client):
+    async with _annotated_params_worker(client) as (client, task_queue):
+        handle = await client.start_workflow(
+            AnnotatedParamsWorkflow.run,
+            args=[1, "abc"],
+            id=str(uuid.uuid4()),
+            task_queue=task_queue,
+        )
+        # The handler returns a padded lowercase string
+        assert (
+            await handle.execute_update(AnnotatedParamsWorkflow.bump, args=[1, "xyz"])
+            == "XYZ"
+        )
+        with pytest.raises(pydantic.ValidationError):
+            await handle.query(AnnotatedParamsWorkflow.bad_query_return)
+        with pytest.raises(pydantic.ValidationError):
+            await handle.execute_update(AnnotatedParamsWorkflow.bad_update_return)
+        await handle.terminate()
+
+        with pytest.raises(pydantic.ValidationError):
+            await client.execute_workflow(
+                AnnotatedBadReturnWorkflow.run,
+                id=str(uuid.uuid4()),
+                task_queue=task_queue,
             )
 
 

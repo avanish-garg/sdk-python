@@ -358,6 +358,10 @@ This data converter supports conversion of all types supported by Pydantic to an
 In addition to Pydantic models, these include all `json.dump`-able types, various non-`json.dump`-able standard library
 types such as dataclasses, types from the datetime module, sets, UUID, etc, and custom types composed of any of these.
 
+`Annotated` type hints on workflow, activity, signal, query, and update parameters and return types are validated too, so
+constraints and validators such as `Annotated[int, Field(gt=0)]` or `PositiveInt` are applied to those values just as they
+are to model fields. The default data converter ignores `Annotated` metadata and uses the underlying type.
+
 Pydantic v1 is not supported by this data converter. If you are not yet able to upgrade from Pydantic v1, see
 https://github.com/temporalio/samples-python/tree/main/pydantic_converter/v1 for limited v1 support.
 

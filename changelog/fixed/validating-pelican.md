@@ -1,0 +1,1 @@
+Pydantic data converter: `Annotated` constraints and validators on workflow, activity, signal, query, and update parameters and return types, such as `Annotated[int, Field(gt=0)]`, are now enforced instead of being silently ignored. Arguments that violate them now fail like invalid model fields do. The default data converter ignores `Annotated` metadata.

@@ -13,7 +13,7 @@ from typing import (
 )
 
 from annotated_types import Len
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, WithJsonSchema
 
 from temporalio import workflow
 
@@ -30,6 +30,16 @@ with workflow.unsafe.imports_passed_through():
 
 SequenceType = TypeVar("SequenceType", bound=Sequence[Any])
 ShortSequence = Annotated[SequenceType, Len(max_length=2)]
+
+
+def _strip_and_upper(value: str) -> str:
+    return value.strip().upper()
+
+
+# Constraints and validators declared on bare parameter/return annotations
+# instead of on model fields
+PositiveQty = Annotated[int, Field(gt=0)]
+UpperSku = Annotated[str, AfterValidator(_strip_and_upper)]
 
 
 class SpecialTypesModel(BaseModel):

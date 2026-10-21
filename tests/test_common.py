@@ -3,7 +3,7 @@ from __future__ import annotations
 import pickle
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 
@@ -16,6 +16,7 @@ from temporalio.common import (
     SearchAttributeKey,
     SearchAttributePair,
     TypedSearchAttributes,
+    _strip_annotated,
     _type_hints_from_func,
 )
 
@@ -72,6 +73,31 @@ def test_type_hints_from_func():
     assert_hints(MyCallableClass)
     assert_hints(MyCallableClass.some_method)
     assert_hints(MyCallableClass().some_method)
+
+
+def test_type_hints_from_func_keeps_annotated():
+    def func(
+        _foo: Annotated[int, "foo"],
+        _bar: Annotated[list[Annotated[str, "item"]], "bar"],
+    ) -> Annotated[DefinedLater, "ret"]:
+        raise NotImplementedError
+
+    args, return_hint = _type_hints_from_func(func)
+    assert args == [
+        Annotated[int, "foo"],
+        Annotated[list[Annotated[str, "item"]], "bar"],
+    ]
+    assert return_hint == Annotated[DefinedLater, "ret"]
+
+
+def test_strip_annotated():
+    assert _strip_annotated(Annotated[int, "a"]) is int
+    assert _strip_annotated(Annotated[Annotated[int, "a"], "b"]) is int
+    assert _strip_annotated(Annotated[list[int], "a"]) == list[int]
+    # Only the outermost wrapper is removed
+    assert _strip_annotated(list[Annotated[int, "a"]]) == list[Annotated[int, "a"]]
+    assert _strip_annotated(int) is int
+    assert _strip_annotated(None) is None
 
 
 def test_raw_value_pickle():

@@ -13,11 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import IntEnum
 from typing import (
+    Annotated,
     Any,
     ClassVar,
     Generic,
     TypeAlias,
     TypeVar,
+    get_args,
     get_origin,
     get_type_hints,
     overload,
@@ -1377,6 +1379,13 @@ _non_user_defined_callables = (
 )
 
 
+def _strip_annotated(hint: Any) -> Any:  # type:ignore[reportUnusedFunction]
+    """Remove any outermost ``Annotated`` wrapper from a type hint."""
+    while get_origin(hint) is Annotated:
+        hint = get_args(hint)[0]
+    return hint
+
+
 def _type_hints_from_func(  # type:ignore[reportUnusedFunction]
     func: Callable,
 ) -> tuple[list[type] | None, type | None]:
@@ -1389,7 +1398,8 @@ def _type_hints_from_func(  # type:ignore[reportUnusedFunction]
         Tuple containing parameter types and return type. The parameter types
         will be None if there are any non-positional parameters or if any of the
         parameters to not have an annotation that represents a class. If the
-        first parameter is "self" with no attribute, it is not included.
+        first parameter is "self" with no attribute, it is not included. Hints
+        keep their ``Annotated`` metadata so converters can use it.
     """
     # If this is a class instance with user-defined __call__, then use that as
     # the func. This mimics inspect logic inside Python.
@@ -1412,7 +1422,7 @@ def _type_hints_from_func(  # type:ignore[reportUnusedFunction]
     # which is only supported in >= 3.10. But typing.get_type_hints is supported
     # in >= 3.7.
     sig = inspect.signature(func)
-    hints = get_type_hints(func)
+    hints = get_type_hints(func, include_extras=True)
     ret_hint = hints.get("return")
     ret = ret_hint if ret_hint is not inspect.Signature.empty else None
     args: list[type] = []

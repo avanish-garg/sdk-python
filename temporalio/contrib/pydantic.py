@@ -51,6 +51,9 @@ class PydanticJSONPlainPayloadConverter(EncodingPayloadConverter):
     types from the datetime module, sets, UUID, etc, and custom types composed
     of any of these.
 
+    ``Annotated`` metadata on type hints, such as the constraints and validators
+    of a workflow or activity parameter, is applied during conversion.
+
     Pickling preserves the cache size limit but excludes cached type adapters.
 
     See https://docs.pydantic.dev/latest/api/standard_library_types/

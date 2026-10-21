@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from typing import (
+    Annotated,
     Any,
     Dict,  # type:ignore[reportDeprecated]
     Generic,
@@ -1223,6 +1224,56 @@ async def test_json_type_converter():
     assert [addr, addr] == (
         await custom_conv.decode([list_payload], [list[ipaddress.IPv4Address]])
     )[0]
+
+
+async def test_default_converter_annotated_type_hints():
+    # Annotated metadata is not interpreted by the default converter, only the
+    # underlying type is used
+    converter = DataConverter.default
+    data_class = MyDataClass("a", 1, SerializableEnum.FOO)
+
+    async def round_trip(
+        hint: Any, value: Any, expected: Any = temporalio.common._arg_unset
+    ) -> None:
+        [decoded] = await converter.decode(await converter.encode([value]), [hint])
+        if expected is temporalio.common._arg_unset:
+            expected = value
+        assert decoded == expected
+
+    await round_trip(Annotated[int, "x"], 5)
+    await round_trip(Annotated[float, "x"], 5, 5.0)
+    await round_trip(Annotated[str, "x"], "foo")
+    await round_trip(Annotated[MyDataClass, "x"], data_class)
+    await round_trip(Annotated[Annotated[int, "x"], "y"], 5)
+    await round_trip(Annotated[int | None, "x"], None)
+    await round_trip(typing.Optional[Annotated[int, "x"]], 5)  # type:ignore[reportDeprecated]
+    await round_trip(Annotated[list[Annotated[int, "x"]], "y"], [1, 2])
+    await round_trip(dict[str, Annotated[MyDataClass, "x"]], {"k": data_class})
+    await round_trip(Annotated[Literal["a", "b"], "x"], "a")
+
+    # The underlying type is still checked
+    with pytest.raises(TypeError):
+        await round_trip(Annotated[int, "x"], "not-an-int")
+    with pytest.raises(TypeError):
+        await round_trip(Annotated[Literal["a"], "x"], "b")
+
+    # Raw values and transfer types are still recognized
+    [raw] = await converter.decode(
+        await converter.encode([5]), [cast(Any, Annotated[RawValue, "x"])]
+    )
+    assert isinstance(raw, RawValue)
+    transfer_value = TemporalTransferTypeValue("workflow-id")
+    await round_trip(Annotated[TemporalTransferTypeValue, "x"], transfer_value)
+
+    # Custom type converters only see the underlying type
+    custom_conv = dataclasses.replace(
+        DataConverter.default, payload_converter_class=IPv4AddressPayloadConverter
+    )
+    addr = ipaddress.IPv4Address("1.2.3.4")
+    assert [addr] == await custom_conv.decode(
+        await custom_conv.encode([addr]),
+        [cast(Any, Annotated[ipaddress.IPv4Address, "x"])],
+    )
 
 
 def test_value_to_type_literal_key():

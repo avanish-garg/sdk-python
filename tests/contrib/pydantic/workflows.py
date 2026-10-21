@@ -5,9 +5,11 @@ from uuid import UUID
 from pydantic import BaseModel, create_model
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from tests.contrib.pydantic.activities import (
+        annotated_params_activity,
         misc_objects_activity,
         pydantic_objects_activity,
     )
@@ -15,8 +17,10 @@ with workflow.unsafe.imports_passed_through():
 from tests.contrib.pydantic.models import (
     ComplexCustomType,
     ComplexCustomUnionType,
+    PositiveQty,
     PydanticModels,
     PydanticModelWithStrictField,
+    UpperSku,
     make_list_of_pydantic_objects,
 )
 
@@ -172,3 +176,71 @@ class NoTypeAnnotationsWorkflow:
     @workflow.run
     async def run(self, arg):  # type: ignore[reportMissingParameterType]
         return arg
+
+
+@workflow.defn
+class AnnotatedParamsWorkflow:
+    def __init__(self) -> None:
+        self.total = 0
+        self.skus: list[str] = []
+        self.done = False
+
+    @workflow.run
+    async def run(self, qty: PositiveQty, sku: UpperSku) -> str:
+        # The caller sends the raw values, so these are only normalized if the
+        # parameter annotations were applied when decoding the arguments
+        await workflow.wait_condition(lambda: self.done)
+        return f"{qty}:{sku}:{self.total}:{self.skus}"
+
+    @workflow.signal
+    def add(self, qty: PositiveQty) -> None:
+        self.total += qty
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
+
+    @workflow.query
+    def total_times(self, factor: PositiveQty) -> int:
+        return self.total * factor
+
+    @workflow.query
+    def describe(self, sku: UpperSku) -> str:
+        return f"[{sku}]"
+
+    @workflow.query
+    def bad_query_return(self) -> PositiveQty:
+        return -1
+
+    @workflow.update
+    def bump(self, qty: PositiveQty, sku: UpperSku) -> UpperSku:
+        self.total += qty
+        self.skus.append(sku)
+        # Padded and lowercase so the caller can observe the return type's
+        # validator
+        return f" {sku.lower()} "
+
+    @workflow.update
+    def bad_update_return(self) -> PositiveQty:
+        return -1
+
+
+@workflow.defn
+class AnnotatedActivityParamsWorkflow:
+    @workflow.run
+    async def run(self, qty: int, sku: str) -> UpperSku:
+        # Unlike the workflow parameters, these are raw, so only the activity's
+        # own annotations can normalize them
+        return await workflow.execute_activity(
+            annotated_params_activity,
+            args=[qty, sku],
+            start_to_close_timeout=timedelta(minutes=1),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+
+
+@workflow.defn
+class AnnotatedBadReturnWorkflow:
+    @workflow.run
+    async def run(self) -> PositiveQty:
+        return -1

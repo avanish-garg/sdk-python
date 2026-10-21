@@ -5467,6 +5467,149 @@ if sys.version_info >= (3, 11):
             )
 
 
+@dataclass
+class AnnotatedParamData:
+    value: int
+
+
+@activity.defn
+async def annotated_params_activity(
+    data: typing.Annotated[AnnotatedParamData, "metadata"],
+    count: typing.Annotated[int, "metadata"],
+) -> typing.Annotated[list[AnnotatedParamData], "metadata"]:
+    return [AnnotatedParamData(data.value + i) for i in range(count)]
+
+
+@activity.defn(dynamic=True)
+async def annotated_dynamic_activity(
+    args: typing.Annotated[Sequence[RawValue], "metadata"],
+) -> str:
+    return f"dynamic activity with {len(args)} args"
+
+
+@workflow.defn
+class AnnotatedParamsWorkflow:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.done = False
+
+    @workflow.run
+    async def run(
+        self,
+        data: typing.Annotated[AnnotatedParamData, "metadata"],
+        count: typing.Annotated[int, "metadata"],
+    ) -> typing.Annotated[list[AnnotatedParamData], "metadata"]:
+        assert isinstance(data, AnnotatedParamData)
+        results = await workflow.execute_activity(
+            annotated_params_activity,
+            args=[data, count],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        assert isinstance(results[0], AnnotatedParamData)
+        self.events.append(
+            await workflow.execute_activity(
+                "not-registered",
+                data,
+                result_type=str,
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+        )
+        await workflow.wait_condition(lambda: self.done)
+        return results
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
+
+    @workflow.signal
+    def some_signal(
+        self, data: typing.Annotated[AnnotatedParamData, "metadata"]
+    ) -> None:
+        assert isinstance(data, AnnotatedParamData)
+        self.events.append(f"signal {data.value}")
+
+    @workflow.signal(dynamic=True)
+    def dynamic_signal(
+        self,
+        name: typing.Annotated[str, "metadata"],
+        args: typing.Annotated[Sequence[RawValue], "metadata"],
+    ) -> None:
+        self.events.append(f"dynamic signal {name} {len(args)}")
+
+    @workflow.query
+    def get_events(self) -> list[str]:
+        # Handlers run in arrival order, which the test does not control
+        return sorted(self.events)
+
+    @workflow.query
+    def some_query(
+        self, data: typing.Annotated[AnnotatedParamData, "metadata"]
+    ) -> typing.Annotated[AnnotatedParamData, "metadata"]:
+        assert isinstance(data, AnnotatedParamData)
+        return AnnotatedParamData(data.value + 1)
+
+    @workflow.query(dynamic=True)
+    def dynamic_query(
+        self,
+        name: typing.Annotated[str, "metadata"],
+        args: typing.Annotated[Sequence[RawValue], "metadata"],
+    ) -> str:
+        return f"dynamic query {name} {len(args)}"
+
+    @workflow.update
+    def some_update(
+        self, data: typing.Annotated[AnnotatedParamData, "metadata"]
+    ) -> typing.Annotated[AnnotatedParamData, "metadata"]:
+        assert isinstance(data, AnnotatedParamData)
+        self.events.append(f"update {data.value}")
+        return AnnotatedParamData(data.value + 1)
+
+    @workflow.update(dynamic=True)
+    def dynamic_update(
+        self,
+        name: typing.Annotated[str, "metadata"],
+        args: typing.Annotated[Sequence[RawValue], "metadata"],
+    ) -> str:
+        return f"dynamic update {name} {len(args)}"
+
+
+async def test_workflow_annotated_params_default_converter(client: Client):
+    # Annotated hints must keep decoding to the underlying type
+    async with new_worker(
+        client,
+        AnnotatedParamsWorkflow,
+        activities=[annotated_params_activity, annotated_dynamic_activity],
+    ) as worker:
+        handle = await client.start_workflow(
+            AnnotatedParamsWorkflow.run,
+            args=[AnnotatedParamData(10), 2],
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        await handle.signal(AnnotatedParamsWorkflow.some_signal, AnnotatedParamData(1))
+        await handle.signal("unknown-signal", "foo")
+        assert AnnotatedParamData(6) == await handle.query(
+            AnnotatedParamsWorkflow.some_query, AnnotatedParamData(5)
+        )
+        assert "dynamic query unknown-query 1" == await handle.query(
+            "unknown-query", "foo"
+        )
+        assert AnnotatedParamData(8) == await handle.execute_update(
+            AnnotatedParamsWorkflow.some_update, AnnotatedParamData(7)
+        )
+        assert "dynamic update unknown-update 1" == await handle.execute_update(
+            "unknown-update", "foo", result_type=str
+        )
+        assert [
+            "dynamic activity with 1 args",
+            "dynamic signal unknown-signal 1",
+            "signal 1",
+            "update 7",
+        ] == await handle.query(AnnotatedParamsWorkflow.get_events)
+        await handle.signal(AnnotatedParamsWorkflow.finish)
+        assert [AnnotatedParamData(10), AnnotatedParamData(11)] == await handle.result()
+
+
 @activity.defn
 async def custom_metrics_activity() -> None:
     counter = activity.metric_meter().create_counter(

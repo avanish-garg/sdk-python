@@ -432,10 +432,12 @@ def _assert_dynamic_handler_args(
     if (
         not arg_types
         or len(arg_types) != 2
-        or arg_types[0] is not str
+        or temporalio.common._strip_annotated(arg_types[0]) is not str
         or (
-            arg_types[1] != Sequence[temporalio.common.RawValue]
-            and arg_types[1] != typing.Sequence[temporalio.common.RawValue]  # type: ignore[reportDeprecated]
+            temporalio.common._strip_annotated(arg_types[1])
+            != Sequence[temporalio.common.RawValue]
+            and temporalio.common._strip_annotated(arg_types[1])
+            != typing.Sequence[temporalio.common.RawValue]  # type: ignore[reportDeprecated]
         )
     ):
         raise RuntimeError(

@@ -2,7 +2,7 @@ from datetime import datetime
 from uuid import UUID
 
 from temporalio import activity
-from tests.contrib.pydantic.models import PydanticModels
+from tests.contrib.pydantic.models import PositiveQty, PydanticModels, UpperSku
 
 
 @activity.defn
@@ -33,3 +33,9 @@ async def misc_objects_activity(
     UUID,
 ]:
     return models
+
+
+@activity.defn
+async def annotated_params_activity(qty: PositiveQty, sku: UpperSku) -> UpperSku:
+    # Padded and lowercase so callers can observe the return type's validator
+    return f" {qty}:{sku.lower()} "

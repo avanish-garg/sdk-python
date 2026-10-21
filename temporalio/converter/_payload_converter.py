@@ -362,7 +362,10 @@ class CompositePayloadConverter(PayloadConverter, WithSerializationContext):
         type_hints = type_hints or []
         for index, (payload, type_hint) in enumerate(zip_longest(payloads, type_hints)):
             # Raw value should just wrap
-            if type_hint == temporalio.common.RawValue:
+            if (
+                temporalio.common._strip_annotated(type_hint)
+                == temporalio.common.RawValue
+            ):
                 values.append(temporalio.common.RawValue(payload))
                 continue
             encoding = payload.metadata.get("encoding", b"<unknown>")
@@ -630,7 +633,8 @@ class _TemporalTransferTypePayloadConverter(PayloadConverter, WithSerializationC
         if type_hints is None:
             return self._inner_payload_converter.from_payloads(payloads, None)
         converters = [
-            _get_transfer_type_converter(type_hint) for type_hint in type_hints
+            _get_transfer_type_converter(temporalio.common._strip_annotated(type_hint))
+            for type_hint in type_hints
         ]
         inner_type_hints = [
             converter.transfer_type if converter is not None else type_hint
@@ -640,7 +644,9 @@ class _TemporalTransferTypePayloadConverter(PayloadConverter, WithSerializationC
             payloads, typing.cast("list[type]", inner_type_hints)
         )
         return [
-            converter.from_transfer_type(value, type_hint)
+            converter.from_transfer_type(
+                value, temporalio.common._strip_annotated(type_hint)
+            )
             if converter is not None
             else value
             for value, converter, type_hint in zip(values, converters, type_hints)
@@ -837,6 +843,10 @@ def value_to_type(
     Raises:
         TypeError: Unable to convert to the given hint.
     """
+    # Annotated metadata is only meaningful to converters that understand it
+    # (e.g. Pydantic), so the default conversion sees the underlying type
+    hint = temporalio.common._strip_annotated(hint)
+
     # Try custom converters
     for conv in custom_converters:
         ret = conv.to_typed_value(hint, value)
